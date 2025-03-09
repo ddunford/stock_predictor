@@ -47,13 +47,27 @@ const App = () => {
   const stocks = filteredData.filter((d) => !d.Stock.includes("USD"));
   const crypto = filteredData.filter((d) => d.Stock.includes("USD"));
 
-  // Create a full stock list including crypto
+  // Full stock/crypto list
   const stockList = ["All", ...new Set([...stocks.map((s) => s.Stock), ...crypto.map((c) => c.Stock)])];
 
+  // Auto-switch asset type based on stock selection
+  const handleStockSelect = (value: string) => {
+    setSelectedStock(value);
+    if (crypto.map((c) => c.Stock).includes(value)) {
+      setSelectedAssetType("crypto");
+    } else {
+      setSelectedAssetType("stocks");
+    }
+  };
+
+  // Reset stock selection when switching Stocks/Crypto
+  const handleAssetSwitch = (type: "stocks" | "crypto") => {
+    setSelectedAssetType(type);
+    setSelectedStock("All");
+  };
+
   // Filter selected stock
-  const filteredStocks = selectedStock === "All" ? stocks : stocks.filter((s) => s.Stock === selectedStock);
-  const filteredCrypto = selectedStock === "All" ? crypto : crypto.filter((s) => s.Stock === selectedStock);
-  const selectedData = selectedAssetType === "stocks" ? filteredStocks : filteredCrypto;
+  const selectedData = selectedStock === "All" ? (selectedAssetType === "stocks" ? stocks : crypto) : filteredData.filter((s) => s.Stock === selectedStock);
 
   // Pagination logic
   const indexOfLastRow = currentPage * rowsPerPage;
@@ -61,7 +75,10 @@ const App = () => {
   const currentRows = selectedData.slice(indexOfFirstRow, indexOfLastRow);
   const totalPages = Math.ceil(selectedData.length / rowsPerPage);
 
-  // Format graph data to correctly show predicted vs actual
+  // Get unique stock names for plotting multiple lines
+  const uniqueStocks = [...new Set(selectedData.map((s) => s.Stock))];
+
+  // Format graph data to correctly show predicted vs actual for each stock
   const formatGraphData = (dataset: Prediction[]) => {
     const groupedData: { [key: string]: any } = {};
     dataset.forEach((entry) => {
@@ -77,33 +94,35 @@ const App = () => {
 
   return (
     <div className="min-h-screen bg-gray-100 p-6">
-      <h1 className="text-2xl font-bold mb-4">📈 Stock Prediction Results</h1>
+      <h1 className="text-2xl font-bold text-center mb-6">📈 Stock Prediction Results</h1>
 
       {/* Filters UI */}
-      <div className="flex flex-wrap gap-4 mb-6">
+      <div className="flex flex-wrap items-center justify-center gap-4 mb-6">
         {/* Date Range Filters */}
         <div className="flex space-x-2">
-          <button className={`px-4 py-2 rounded ${dateRange === "1d" ? "bg-blue-500 text-white" : "bg-gray-300"}`} onClick={() => setDateRange("1d")}>Last 24 Hours</button>
-          <button className={`px-4 py-2 rounded ${dateRange === "7d" ? "bg-blue-500 text-white" : "bg-gray-300"}`} onClick={() => setDateRange("7d")}>Last 7 Days</button>
-          <button className={`px-4 py-2 rounded ${dateRange === "30d" ? "bg-blue-500 text-white" : "bg-gray-300"}`} onClick={() => setDateRange("30d")}>Last 30 Days</button>
+          {["1d", "7d", "30d"].map((range) => (
+            <button key={range} className={`px-4 py-2 rounded ${dateRange === range ? "bg-blue-500 text-white" : "bg-gray-300 hover:bg-gray-400"}`} onClick={() => setDateRange(range as "1d" | "7d" | "30d")}>
+              {range === "1d" ? "Last 24 Hours" : range === "7d" ? "Last 7 Days" : "Last 30 Days"}
+            </button>
+          ))}
         </div>
 
         {/* Asset Type Selector */}
         <div className="flex space-x-2">
-          <button className={`px-4 py-2 rounded ${selectedAssetType === "stocks" ? "bg-blue-500 text-white" : "bg-gray-300"}`} onClick={() => setSelectedAssetType("stocks")}>Stocks</button>
-          <button className={`px-4 py-2 rounded ${selectedAssetType === "crypto" ? "bg-green-500 text-white" : "bg-gray-300"}`} onClick={() => setSelectedAssetType("crypto")}>Crypto</button>
+          <button className={`px-4 py-2 rounded ${selectedAssetType === "stocks" ? "bg-blue-500 text-white" : "bg-gray-300 hover:bg-gray-400"}`} onClick={() => handleAssetSwitch("stocks")}>Stocks</button>
+          <button className={`px-4 py-2 rounded ${selectedAssetType === "crypto" ? "bg-green-500 text-white" : "bg-gray-300 hover:bg-gray-400"}`} onClick={() => handleAssetSwitch("crypto")}>Crypto</button>
         </div>
 
         {/* Stock Selector */}
-        <select className="px-4 py-2 border rounded" onChange={(e) => setSelectedStock(e.target.value)} value={selectedStock}>
+        <select className="px-4 py-2 border rounded bg-white" onChange={(e) => handleStockSelect(e.target.value)} value={selectedStock}>
           {stockList.map((stock) => (
             <option key={stock} value={stock}>{stock}</option>
           ))}
         </select>
       </div>
 
-      {/* Table View */}
-      <div className="overflow-x-auto">
+      {/* Table */}
+      <div className="overflow-x-auto mb-6">
         <table className="w-full bg-white shadow-md rounded-lg">
           <thead className="bg-gray-200">
             <tr>
@@ -131,7 +150,7 @@ const App = () => {
       </div>
 
       {/* Graph */}
-      <h2 className="text-xl font-bold mt-6">📊 {selectedStock === "All" ? "All Predictions" : selectedStock}</h2>
+      <h2 className="text-xl font-bold mt-6 text-center">📊 {selectedStock === "All" ? "All Predictions" : selectedStock}</h2>
       <ResponsiveContainer width="100%" height={400}>
         <LineChart data={formatGraphData(selectedData)}>
           <CartesianGrid strokeDasharray="3 3" />
@@ -139,8 +158,12 @@ const App = () => {
           <YAxis />
           <Tooltip />
           <Legend />
-          <Line type="monotone" dataKey={`${selectedStock} - Predicted`} stroke="blue" dot={{ r: 4 }} />
-          <Line type="monotone" dataKey={`${selectedStock} - Actual`} stroke="red" dot={{ r: 4 }} />
+          {uniqueStocks.map((stock) => (
+            <>
+              <Line key={`${stock}-predicted`} type="monotone" dataKey={`${stock} - Predicted`} stroke="blue" />
+              <Line key={`${stock}-actual`} type="monotone" dataKey={`${stock} - Actual`} stroke="red" />
+            </>
+          ))}
         </LineChart>
       </ResponsiveContainer>
     </div>
