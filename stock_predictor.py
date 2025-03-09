@@ -11,6 +11,11 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error
+import csv
+import os
+from datetime import datetime, timezone
+import pandas as pd
+import yfinance as yf
 
 # Configuration
 STOCKS_TO_TRACK = ["AAPL", "TSLA", "GOOGL", "AMZN", "MSFT", "BTC-USD"]
@@ -148,58 +153,95 @@ def save_prediction(stock, predicted_price):
 
     df.to_csv(PREDICTION_FILE, mode="a", header=not os.path.exists(PREDICTION_FILE), index=False)
 
+
+import csv
+import os
+from datetime import datetime, timedelta, timezone
+
+LOG_FILE = "prediction_accuracy_log.csv"
+
+def log_prediction_accuracy(predicted_datetime, actual_datetime, stock, predicted, actual, error, correct):
+    """Logs the predicted vs. actual prices into a CSV file with timestamps."""
+    log_exists = os.path.exists(LOG_FILE)
+
+    with open(LOG_FILE, mode="a", newline="") as file:
+        writer = csv.writer(file)
+        if not log_exists:
+            writer.writerow(["Predicted Time", "Actual Time", "Stock", "Predicted Price", "Actual Price", "Error %", "Correct?"])
+        writer.writerow([
+            predicted_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+            actual_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+            stock,
+            f"${predicted:.2f}",
+            f"${actual:.2f}",
+            f"{error:.2f}%",
+            correct
+        ])
+
 def update_actual_prices():
-    """Update actual prices for all past predictions using the most recent available price."""
+    """Update actual stock/crypto prices for past predictions and log the actual timestamp."""
     if not os.path.exists(PREDICTION_FILE):
         return
 
     df = pd.read_csv(PREDICTION_FILE)
 
-    unverified = df[df["Actual_Close"].isna()]  # Find all missing actual prices
+    if "Actual_Time" not in df.columns:
+        df["Actual_Time"] = ""  # Add column if missing
+
+    unverified = df[df["Actual_Close"].isna()]
     if unverified.empty:
         return
 
+    today = datetime.now(timezone.utc).date()
+
     for index, row in unverified.iterrows():
         stock = row["Stock"]
-        prediction_time = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M:%S")
+        predicted_datetime = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
-        # Determine how far ahead we should check actual prices
-        if "USD" in stock:  # Crypto (BTC-USD, ETH-USD, etc.) → Use hourly price
-            interval = "1h"
-        else:  # Stocks → Use closest available price (1h intraday or 1d close)
-            interval = "1h"
+        if predicted_datetime.date() > today:
+            continue
 
-        actual_price = None  # Ensure variable is always defined
+        interval = "1h" if "USD" in stock else "1d"
 
-        # Fetch actual price data
         try:
             stock_data = yf.download(stock, period="1d", interval=interval, progress=False, auto_adjust=False)
 
             if stock_data.empty:
-                print(f"⚠ No actual price data for {stock} on {row['Date']}. Skipping...")
                 continue
 
+            if stock_data.index.tzinfo is None:
+                stock_data.index = stock_data.index.tz_localize("UTC")
+            else:
+                stock_data.index = stock_data.index.tz_convert("UTC")
+
             # Find the closest timestamped price
-            closest_time = stock_data.index.asof(prediction_time)
+            closest_time = stock_data.index.asof(predicted_datetime)
+
             if pd.isna(closest_time):
-                continue  # Skip if there's no valid close price
+                continue
 
             actual_price = stock_data.loc[closest_time, "Close"]
 
-            # Ensure actual_price is a float, not a Pandas Series
             if isinstance(actual_price, pd.Series):
                 actual_price = actual_price.iloc[0]
 
             df.at[index, "Actual_Close"] = float(actual_price)
+            df.at[index, "Actual_Time"] = closest_time.strftime("%Y-%m-%d %H:%M:%S")  # Save actual timestamp
 
             predicted_price = row["Predicted_Close"]
             error = abs(predicted_price - actual_price) / actual_price * 100
-            df.at[index, "Correct"] = "✅" if error <= 5 else "❌"
+            correct = "✅" if error <= 5 else "❌"
+
+            df.at[index, "Correct"] = correct
+
+            # 🔥 Log the prediction vs. actual price with timestamps
+            log_prediction_accuracy(predicted_datetime, closest_time, stock, predicted_price, actual_price, error, correct)
 
         except Exception as e:
             print(f"⚠ Error updating actual price for {stock}: {str(e)}")
 
     df.to_csv(PREDICTION_FILE, index=False)
+
 
 def main(args):
     if args.view:
