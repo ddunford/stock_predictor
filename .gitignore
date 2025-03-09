@@ -49,6 +49,7 @@ flask.log
 # Prediction files
 predictions.csv
 prediction_accuracy_log.csv
+models/* 
 
 # UI Logs
 ui.log

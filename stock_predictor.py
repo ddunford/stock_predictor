@@ -1,299 +1,252 @@
-import yfinance as yf
-import pandas as pd
 import numpy as np
-import os
-import ssl
-import urllib3
-import argparse
-import requests
-from datetime import datetime, timezone, time
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-from xgboost import XGBRegressor
-from sklearn.metrics import mean_absolute_error
-import csv
-import os
-from datetime import datetime, timezone
 import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
 import yfinance as yf
+import datetime
+import os
+import csv
 
-# Configuration
-STOCKS_TO_TRACK = ["AAPL", "TSLA", "GOOGL", "AMZN", "MSFT", "BTC-USD"]
-LOOKBACK_DAYS = 60
-PREDICTION_DAYS = 5
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PREDICTION_FILE = os.path.join(SCRIPT_DIR, "predictions.csv")
-LOG_FILE = os.path.join(SCRIPT_DIR, "stock_predictor.log")
+# Suppress excessive TensorFlow CUDA warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # 0 = all messages, 1 = INFO, 2 = WARN, 3 = ERROR only
 
-# Ignore SSL verification issues temporarily
-ssl._create_default_https_context = ssl._create_unverified_context
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-import requests
-
-def get_gbp_exchange_rate():
-    """Fetch the latest USD to GBP exchange rate."""
+# 🚀 GPU Configuration (Ensures TensorFlow runs on GPU)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
     try:
-        response = requests.get("https://api.exchangerate-api.com/v4/latest/USD")
-        data = response.json()
-        return data["rates"]["GBP"]
-    except Exception as e:
-        print(f"⚠ Error fetching GBP exchange rate: {e}")
-        return 0.78  # Default fallback exchange rate (update as needed)
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
 
-def fetch_stock_data(stock, period="2y"):
-    """Fetch historical stock/crypto data, handling missing price errors."""
-    session = requests.Session()
-    session.verify = True  # Ensure SSL verification
+        # Avoid duplicate registration of CUDA plugins
+        os.environ["XLA_FLAGS"] = "--xla_gpu_cuda_data_dir=/usr/local/cuda"
 
-    try:
-        data = yf.download(stock, period=period, auto_adjust=False, session=session, progress=False)
+        print(f"✅ Using {len(gpus)} GPUs: {[gpu.name for gpu in gpus]}")
+    except RuntimeError as e:
+        print(f"⚠ GPU Setup Error: {e}")
+else:
+    print("⚠ No GPU detected, running on CPU.")
 
-        if data.empty:
-            print(f"⚠ Warning: No data received for {stock}. Trying latest available day...")
 
-            # Try fetching the last available data instead of failing
-            data = yf.download(stock, period="7d", interval="1d", auto_adjust=False, session=session)
-            if data.empty:
-                print(f"❌ Still no data for {stock}. Skipping...")
-                return None
-
-        # Remove weekends for stocks, but keep for crypto (which trades 24/7)
-        if "USD" not in stock:  # Crypto like BTC-USD trades all days
-            data = data[data.index.dayofweek < 5]
-
-        return data
-    except Exception as e:
-        print(f"❌ Failed to get data for {stock} due to: {str(e)}")
-        return None
-
-def compute_indicators(data):
-    """Add technical indicators"""
-    data["SMA50"] = data["Close"].rolling(window=50).mean()
-    data["SMA200"] = data["Close"].rolling(window=200).mean()
-    data["RSI"] = compute_rsi(data["Close"])
-    data["Momentum"] = data["Close"].diff()
-    data["Volatility"] = data["Close"].rolling(20).std()
-    data.dropna(inplace=True)
-    return data
-
-def compute_rsi(series, period=14):
-    """Compute Relative Strength Index (RSI)"""
-    delta = series.diff(1)
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def train_model(stock_data):
-    """Train XGBoost model"""
-    stock_data["Target"] = stock_data["Close"].shift(-PREDICTION_DAYS)
+# 📌 Fetch stock data from Yahoo Finance
+def fetch_stock_data(ticker, start="2020-01-01"):
+    print(f"📈 Fetching data for {ticker}...")
+    stock_data = yf.download(ticker, start=start)
+    stock_data["Daily_Return"] = stock_data["Close"].pct_change()
+    stock_data["Moving_Avg_50"] = stock_data["Close"].rolling(window=50).mean()
+    stock_data["Moving_Avg_200"] = stock_data["Close"].rolling(window=200).mean()
     stock_data.dropna(inplace=True)
+    return stock_data
 
-    features = ["Close", "SMA50", "SMA200", "RSI", "Momentum", "Volatility"]
-    X = stock_data[features]
-    y = stock_data["Target"]
 
-    if X.empty or y.empty:
-        print("⚠ Warning: Not enough data to train the model. Skipping...")
-        return None
 
+LAST_TRAINED_FILE = "last_trained.txt"
+
+def get_model_filename(stock_symbol):
+    return f"models/{stock_symbol}_lstm_model.h5"
+
+def get_last_trained_filename(stock_symbol):
+    return f"models/{stock_symbol}_last_trained.txt"
+
+# 📌 Train or Load LSTM Model per Stock
+def train_lstm_model(stock_data, stock_symbol, retrain_frequency_days=7):
+    features = ["Close", "Daily_Return", "Moving_Avg_50", "Moving_Avg_200"]
+    target = "Close"
+
+    scaler = MinMaxScaler(feature_range=(0,1))
+    scaled_data = scaler.fit_transform(stock_data[features])
+
+    # Prepare data for LSTM (Last 60 days → Predict next day)
+    sequence_length = 60
+    X, y = [], []
+    for i in range(sequence_length, len(scaled_data)):
+        X.append(scaled_data[i-sequence_length:i])
+        y.append(scaled_data[i, 0])
+
+    X, y = np.array(X), np.array(y)
+
+    # Split data for training/testing
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
-    model = XGBRegressor(objective="reg:squarederror", n_estimators=100)
-    model.fit(X_train, y_train)
+    model_file = get_model_filename(stock_symbol)
+    last_trained_file = get_last_trained_filename(stock_symbol)
 
-    y_pred = model.predict(X_test)
-    mae = mean_absolute_error(y_test, y_pred)
-    print(f"✅ Model trained - MAE: {mae:.2f}")
+    # Check if the model should be retrained
+    if os.path.exists(model_file) and os.path.exists(last_trained_file):
+        with open(last_trained_file, "r") as f:
+            last_trained_date = datetime.datetime.strptime(f.read().strip(), "%Y-%m-%d")
 
-    return model
+        days_since_last_train = (datetime.datetime.now() - last_trained_date).days
+        if days_since_last_train < retrain_frequency_days:
+            print(f"✅ Using pre-trained model for {stock_symbol} (Last trained {days_since_last_train} days ago).")
+            model = load_model(model_file)
+            return model, scaler
 
-def predict_next_days(model, stock_data):
-    """Predict stock price for the next few days"""
-    latest_data = stock_data.tail(LOOKBACK_DAYS)[["Close", "SMA50", "SMA200", "RSI", "Momentum", "Volatility"]]
-    prediction = model.predict(latest_data.tail(1))
-    return prediction[0]
+    # If no model exists or retraining is due, train a new model
+    print(f"🚀 Training AI model for {stock_symbol} from scratch...")
 
-def generate_trade_signals(stock, predicted_price, latest_price):
-    """Generate buy/sell recommendations"""
-    diff = (predicted_price - latest_price) / latest_price * 100
+    model = Sequential([
+        LSTM(128, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+        Dropout(0.2),
+        LSTM(64, return_sequences=False),
+        Dropout(0.2),
+        Dense(32, activation="relu"),
+        Dense(1)
+    ])
 
-    if isinstance(diff, pd.Series):
-        diff = diff.iloc[0]
+    model.compile(optimizer="adam", loss="mean_squared_error")
 
-    if diff > 5:
-        return "BUY"
-    elif diff < -5:
-        return "SELL"
-    else:
-        return "HOLD"
+    # Train model on GPU
+    with tf.device('/GPU:0' if gpus else '/CPU:0'):
+        model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_test, y_test))
 
-from datetime import datetime
+    # Save the model and update the last trained date
+    os.makedirs("models", exist_ok=True)
+    model.save(model_file)
+    with open(last_trained_file, "w") as f:
+        f.write(datetime.datetime.now().strftime("%Y-%m-%d"))
 
-def save_prediction(stock, predicted_price):
-    """Save prediction to CSV file, ensuring timestamps are logged."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Full timestamp
+    print(f"✅ Model for {stock_symbol} saved as {model_file}. Retraining scheduled in {retrain_frequency_days} days.")
+    return model, scaler
 
-    # Load existing data to avoid duplicates
-    if os.path.exists(PREDICTION_FILE):
-        existing_df = pd.read_csv(PREDICTION_FILE)
-    else:
-        existing_df = pd.DataFrame(columns=["Date", "Time", "Stock", "Predicted_Close", "Actual_Close", "Correct"])
 
-    # Append new prediction with timestamp
-    df = pd.DataFrame([{
+# 📌 Predict next price using trained model
+def predict_future_price(model, scaler, stock_data):
+    last_60_days = stock_data[["Close", "Daily_Return", "Moving_Avg_50", "Moving_Avg_200"]].tail(60).values
+    last_60_days_scaled = scaler.transform(last_60_days)
+
+    X_input = np.array([last_60_days_scaled])
+    predicted_price = model.predict(X_input)
+
+    # Convert prediction back to original scale
+    predicted_price = scaler.inverse_transform([[predicted_price[0][0], 0, 0, 0]])[0][0]
+
+    # Calculate the next trading day
+    last_date = stock_data.index[-1]  # Get last available date
+    next_trading_day = last_date + datetime.timedelta(days=1)
+
+    return predicted_price, next_trading_day.strftime("%Y-%m-%d")
+
+# 📌 Convert price from USD to GBP
+def convert_to_gbp(usd_price):
+    conversion_rate = 0.78  # Example: 1 USD = 0.78 GBP
+    return round(usd_price * conversion_rate, 2)
+
+# 📌 Ensure CSV format is correct for UI
+def save_prediction(stock_symbol, predicted_price, predicted_date, actual_price):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    csv_file = "predictions.csv"
+
+    prediction_data = pd.DataFrame([{
         "Date": now.split(" ")[0],
-        "Time": now.split(" ")[1],  # Store the exact time
-        "Stock": stock,
-        "Predicted_Close": predicted_price,
-        "Actual_Close": None,  # Will update later
-        "Correct": None
+        "Time": now.split(" ")[1],
+        "Predicted_Time": now,
+        "Predicted_Date": predicted_date,  # Store the actual date the prediction is for
+        "Actual_Time": "Pending" if pd.isna(actual_price) else now,
+        "Stock": stock_symbol,
+        "Predicted_Close": round(predicted_price, 2),
+        "Predicted_Close_GBP": convert_to_gbp(predicted_price),
+        "Actual_Close": "Pending",  # Defer storing actual price until the next day
+        "Actual_Close_GBP": "Pending",
+        "Correct": "Pending"  # We will update this later when actual price is available
     }])
 
-    df.to_csv(PREDICTION_FILE, mode="a", header=not os.path.exists(PREDICTION_FILE), index=False)
+    file_exists = os.path.isfile(csv_file)
+    prediction_data.to_csv(csv_file, mode="a", index=False, header=not file_exists)
+    print(f"📁 Prediction saved to {csv_file}")
 
-
-import csv
-import os
-from datetime import datetime, timedelta, timezone
-
-LOG_FILE = "prediction_accuracy_log.csv"
-
-def log_prediction_accuracy(predicted_datetime, actual_datetime, stock, predicted, actual, error, correct):
-    """Logs the predicted vs. actual prices into a CSV file with timestamps."""
-    log_exists = os.path.exists(LOG_FILE)
-
-    with open(LOG_FILE, mode="a", newline="") as file:
-        writer = csv.writer(file)
-        if not log_exists:
-            writer.writerow(["Predicted Time", "Actual Time", "Stock", "Predicted Price", "Actual Price", "Error %", "Correct?"])
-        writer.writerow([
-            predicted_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-            actual_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-            stock,
-            f"${predicted:.2f}",
-            f"${actual:.2f}",
-            f"{error:.2f}%",
-            correct
-        ])
-
-
-def is_market_open():
-    """Returns True if the market is open (based on US stock market hours)."""
-    now = datetime.now(timezone.utc)
-    market_open = time(14, 30)  # 9:30 AM US Eastern = 14:30 UTC
-    market_close = time(20, 0)  # 4:00 PM US Eastern = 20:00 UTC
-    return market_open <= now.time() <= market_close
-
+# 📌 Function to update actual prices the next day
 def update_actual_prices():
-    """Update actual stock/crypto prices with correct timestamps based on market hours."""
-    if not os.path.exists(PREDICTION_FILE):
-        return
+    print("📈 Updating actual prices...")
 
-    df = pd.read_csv(PREDICTION_FILE)
+    csv_file = "predictions.csv"
 
-    if "Actual_Time" not in df.columns:
-        df["Actual_Time"] = ""
+    # Ensure the CSV exists
+    if not os.path.exists(csv_file):
+        print("⚠ predictions.csv not found. Creating a new one...")
+        pd.DataFrame(columns=[
+            "Date", "Time", "Predicted_Time", "Predicted_Date", "Actual_Time",
+            "Stock", "Predicted_Close", "Predicted_Close_GBP", "Actual_Close",
+            "Actual_Close_GBP", "Correct"
+        ]).to_csv(csv_file, index=False)
 
-    unverified = df[df["Actual_Close"].isna()]
-    if unverified.empty:
-        return
+    df = pd.read_csv(csv_file)
 
-    now = datetime.now(timezone.utc)
+    for index, row in df.iterrows():
+        if row["Actual_Close"] == "Pending":  # Only update rows where actual price is missing
+            stock = row["Stock"]
+            predicted_date = row["Predicted_Date"]
 
-    for index, row in unverified.iterrows():
-        stock = row["Stock"]
-        predicted_datetime = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            try:
+                # Fetch actual closing price for the exact predicted date
+                actual_data = yf.download(stock, start=predicted_date, end=predicted_date)
 
-        if predicted_datetime.date() > now.date():
-            continue  # Skip future predictions
+                if not actual_data.empty:
+                    # Extract actual price as a float, ensuring it is not a Pandas Series
+                    actual_price = actual_data["Close"].iloc[-1]  # Extract the last closing price
+                    if isinstance(actual_price, pd.Series):
+                        actual_price = actual_price.iloc[0]  # Ensure it's a scalar value
+                    actual_price = float(actual_price)  # Convert to float
 
-        # Use "1h" interval during market hours, "1d" after market close
-        interval = "1h" if is_market_open() else "1d"
+                    # Convert to GBP
+                    actual_price_gbp = convert_to_gbp(actual_price)
 
-        try:
-            stock_data = yf.download(stock, period="7d", interval=interval, progress=False, auto_adjust=False)
+                    df.at[index, "Actual_Close"] = round(actual_price, 2)
+                    df.at[index, "Actual_Close_GBP"] = actual_price_gbp
+                    df.at[index, "Actual_Time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            if stock_data.empty:
-                continue
+                    # Check if prediction was correct
+                    predicted_price = row["Predicted_Close"]
+                    df.at[index, "Correct"] = "✅" if abs(predicted_price - actual_price) < 5 else "❌"
 
-            if stock_data.index.tzinfo is None:
-                stock_data.index = stock_data.index.tz_localize("UTC")
-            else:
-                stock_data.index = stock_data.index.tz_convert("UTC")
+                    print(f"✅ Updated {stock}: {predicted_date} - Actual: ${actual_price:.2f} / £{actual_price_gbp:.2f}")
 
-            # Find the most recent available price
-            if is_market_open():
-                closest_time = stock_data.index[-1]  # Most recent intraday price
-            else:
-                closest_time = stock_data.index.asof(predicted_datetime)  # Last available closing price
+            except Exception as e:
+                print(f"⚠ Error updating actual price for {stock}: {e}")
 
-            if pd.isna(closest_time):
-                continue
-
-            actual_price = stock_data.loc[closest_time, "Close"]
-
-            if isinstance(actual_price, pd.Series):
-                actual_price = actual_price.iloc[0]
-
-            df.at[index, "Actual_Close"] = float(actual_price)
-            df.at[index, "Actual_Time"] = closest_time.strftime("%Y-%m-%d %H:%M:%S")  # Store actual timestamp
-
-            predicted_price = row["Predicted_Close"]
-            error = abs(predicted_price - actual_price) / actual_price * 100
-            correct = "✅" if error <= 5 else "❌"
-
-            df.at[index, "Correct"] = correct
-
-        except Exception as e:
-            print(f"⚠ Error updating actual price for {stock}: {str(e)}")
-
-    df.to_csv(PREDICTION_FILE, index=False)
+    df.to_csv("predictions.csv", index=False)  # Save updated CSV
 
 
-def main(args):
-    if args.view:
-        print(pd.read_csv(PREDICTION_FILE) if os.path.exists(PREDICTION_FILE) else "No stored predictions.")
-        return
 
-    update_actual_prices()
-
-    exchange_rate = get_gbp_exchange_rate()  # Get USD to GBP conversion rate
-
-    for stock in STOCKS_TO_TRACK:
-        print(f"\n📈 Fetching data for {stock}...")
-        stock_data = fetch_stock_data(stock)
-
-        if stock_data is None or stock_data.empty:
-            print(f"⚠ Skipping {stock} due to missing data.")
-            continue
-
-        stock_data = compute_indicators(stock_data)
-        model = train_model(stock_data)
-
-        if model is None:
-            continue
-
-        predicted_price = predict_next_days(model, stock_data)
-        latest_price = stock_data["Close"].iloc[-1]
-
-        if isinstance(predicted_price, pd.Series):
-            predicted_price = predicted_price.iloc[0]
-        if isinstance(latest_price, pd.Series):
-            latest_price = latest_price.iloc[0]
-
-        # Convert USD prices to GBP
-        predicted_price_gbp = predicted_price * exchange_rate
-        latest_price_gbp = latest_price * exchange_rate
-
-        recommendation = generate_trade_signals(stock, predicted_price, latest_price)
-        save_prediction(stock, predicted_price)
-
-        print(f"{recommendation} {stock} (Predicted: ${predicted_price:.2f} / £{predicted_price_gbp:.2f}, Current: ${latest_price:.2f} / £{latest_price_gbp:.2f})")
+# 📌 Read Fortune 500 stock symbols from CSV
+def get_stocks():
+    with open("stocks.csv", "r") as file:
+        reader = csv.DictReader(file)
+        return [row["Ticker"] for row in reader]
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--view", action="store_true", help="View stored predictions")
-    args = parser.parse_args()
-    main(args)
+    update_actual_prices()  # Update actual prices before making new predictions
+
+    stocks = get_stocks()
+
+    for stock_symbol in stocks:
+        try:
+            stock_data = fetch_stock_data(stock_symbol)
+
+            if stock_data.empty:
+                print(f"⚠ No data found for {stock_symbol}, skipping...")
+                continue
+
+            model, scaler = train_lstm_model(stock_data, stock_symbol, retrain_frequency_days=7)
+
+            predicted_price, predicted_date = predict_future_price(model, scaler, stock_data)
+
+            # Ensure actual_price is a float, not a Series
+            if not stock_data.empty and isinstance(stock_data["Close"].iloc[-1], (int, float)):
+                actual_price = float(stock_data["Close"].iloc[-1])  # Extract latest closing price
+            else:
+                actual_price = None  # Store None instead of "Pending" for actual price
+
+            print(f"\n📊 Predicted {stock_symbol} Price: ${predicted_price:.2f} / £{convert_to_gbp(predicted_price)}")
+            print(f"📊 Actual {stock_symbol} Price: {actual_price if actual_price != 'Pending' else 'Pending'}")
+
+            save_prediction(stock_symbol, predicted_price, predicted_date, actual_price)
+
+        except Exception as e:
+            print(f"⚠ Error processing {stock_symbol}: {e}")
+
+    print("\n✅ AI Model completed successfully for all Fortune 500 stocks!")
+
