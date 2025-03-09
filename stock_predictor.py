@@ -6,7 +6,7 @@ import ssl
 import urllib3
 import argparse
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, time
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from xgboost import XGBRegressor
@@ -178,33 +178,42 @@ def log_prediction_accuracy(predicted_datetime, actual_datetime, stock, predicte
             correct
         ])
 
+
+def is_market_open():
+    """Returns True if the market is open (based on US stock market hours)."""
+    now = datetime.now(timezone.utc)
+    market_open = time(14, 30)  # 9:30 AM US Eastern = 14:30 UTC
+    market_close = time(20, 0)  # 4:00 PM US Eastern = 20:00 UTC
+    return market_open <= now.time() <= market_close
+
 def update_actual_prices():
-    """Update actual stock/crypto prices for past predictions and log the actual timestamp."""
+    """Update actual stock/crypto prices with correct timestamps based on market hours."""
     if not os.path.exists(PREDICTION_FILE):
         return
 
     df = pd.read_csv(PREDICTION_FILE)
 
     if "Actual_Time" not in df.columns:
-        df["Actual_Time"] = ""  # Add column if missing
+        df["Actual_Time"] = ""
 
     unverified = df[df["Actual_Close"].isna()]
     if unverified.empty:
         return
 
-    today = datetime.now(timezone.utc).date()
+    now = datetime.now(timezone.utc)
 
     for index, row in unverified.iterrows():
         stock = row["Stock"]
         predicted_datetime = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
-        if predicted_datetime.date() > today:
-            continue
+        if predicted_datetime.date() > now.date():
+            continue  # Skip future predictions
 
-        interval = "1h" if "USD" in stock else "1d"
+        # Use "1h" interval during market hours, "1d" after market close
+        interval = "1h" if is_market_open() else "1d"
 
         try:
-            stock_data = yf.download(stock, period="1d", interval=interval, progress=False, auto_adjust=False)
+            stock_data = yf.download(stock, period="7d", interval=interval, progress=False, auto_adjust=False)
 
             if stock_data.empty:
                 continue
@@ -214,8 +223,11 @@ def update_actual_prices():
             else:
                 stock_data.index = stock_data.index.tz_convert("UTC")
 
-            # Find the closest timestamped price
-            closest_time = stock_data.index.asof(predicted_datetime)
+            # Find the most recent available price
+            if is_market_open():
+                closest_time = stock_data.index[-1]  # Most recent intraday price
+            else:
+                closest_time = stock_data.index.asof(predicted_datetime)  # Last available closing price
 
             if pd.isna(closest_time):
                 continue
@@ -226,16 +238,13 @@ def update_actual_prices():
                 actual_price = actual_price.iloc[0]
 
             df.at[index, "Actual_Close"] = float(actual_price)
-            df.at[index, "Actual_Time"] = closest_time.strftime("%Y-%m-%d %H:%M:%S")  # Save actual timestamp
+            df.at[index, "Actual_Time"] = closest_time.strftime("%Y-%m-%d %H:%M:%S")  # Store actual timestamp
 
             predicted_price = row["Predicted_Close"]
             error = abs(predicted_price - actual_price) / actual_price * 100
             correct = "✅" if error <= 5 else "❌"
 
             df.at[index, "Correct"] = correct
-
-            # 🔥 Log the prediction vs. actual price with timestamps
-            log_prediction_accuracy(predicted_datetime, closest_time, stock, predicted_price, actual_price, error, correct)
 
         except Exception as e:
             print(f"⚠ Error updating actual price for {stock}: {str(e)}")
