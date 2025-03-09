@@ -21,6 +21,7 @@ interface Prediction {
 const App = () => {
   const [data, setData] = useState<Prediction[]>([]);
   const [selectedAssetType, setSelectedAssetType] = useState<"stocks" | "crypto">("stocks");
+  const [selectedStock, setSelectedStock] = useState<string>("All");
   const [dateRange, setDateRange] = useState<"1d" | "7d" | "30d">("7d");
   const [currentPage, setCurrentPage] = useState(1);
   const rowsPerPage = 10;
@@ -42,73 +43,66 @@ const App = () => {
     return true; // Default to 30 days
   });
 
-  // Split data into stocks and crypto
+  // Split into stocks and crypto
   const stocks = filteredData.filter((d) => !d.Stock.includes("USD"));
   const crypto = filteredData.filter((d) => d.Stock.includes("USD"));
+
+  // Create a full stock list including crypto
+  const stockList = ["All", ...new Set([...stocks.map((s) => s.Stock), ...crypto.map((c) => c.Stock)])];
+
+  // Filter selected stock
+  const filteredStocks = selectedStock === "All" ? stocks : stocks.filter((s) => s.Stock === selectedStock);
+  const filteredCrypto = selectedStock === "All" ? crypto : crypto.filter((s) => s.Stock === selectedStock);
+  const selectedData = selectedAssetType === "stocks" ? filteredStocks : filteredCrypto;
 
   // Pagination logic
   const indexOfLastRow = currentPage * rowsPerPage;
   const indexOfFirstRow = indexOfLastRow - rowsPerPage;
-  const currentRows = (selectedAssetType === "stocks" ? stocks : crypto).slice(indexOfFirstRow, indexOfLastRow);
-  const totalPages = Math.ceil((selectedAssetType === "stocks" ? stocks : crypto).length / rowsPerPage);
+  const currentRows = selectedData.slice(indexOfFirstRow, indexOfLastRow);
+  const totalPages = Math.ceil(selectedData.length / rowsPerPage);
 
-  // Format graph data to prevent duplicate dates
+  // Format graph data to correctly show predicted vs actual
   const formatGraphData = (dataset: Prediction[]) => {
-    const grouped: { [key: string]: any } = {};
+    const groupedData: { [key: string]: any } = {};
     dataset.forEach((entry) => {
-      const key = `${entry.Date} ${entry.Time}`; // Ensure timestamps are unique
-      if (!grouped[key]) {
-        grouped[key] = { Date: key };
+      const key = `${entry.Date} ${entry.Time}`;
+      if (!groupedData[key]) {
+        groupedData[key] = { Date: key };
       }
-      grouped[key][`${entry.Stock} - Predicted`] = entry.Predicted_Close;
-      grouped[key][`${entry.Stock} - Actual`] = entry.Actual_Close;
+      groupedData[key][`${entry.Stock} - Predicted`] = entry.Predicted_Close;
+      groupedData[key][`${entry.Stock} - Actual`] = entry.Actual_Close;
     });
-    return Object.values(grouped);
+    return Object.values(groupedData);
   };
 
   return (
     <div className="min-h-screen bg-gray-100 p-6">
       <h1 className="text-2xl font-bold mb-4">📈 Stock Prediction Results</h1>
 
-      {/* Date Range Filter */}
-      <div className="flex space-x-4 mb-4">
-        <button
-          className={`px-4 py-2 rounded ${dateRange === "1d" ? "bg-blue-500 text-white" : "bg-gray-300"}`}
-          onClick={() => setDateRange("1d")}
-        >
-          Last 24 Hours
-        </button>
-        <button
-          className={`px-4 py-2 rounded ${dateRange === "7d" ? "bg-blue-500 text-white" : "bg-gray-300"}`}
-          onClick={() => setDateRange("7d")}
-        >
-          Last 7 Days
-        </button>
-        <button
-          className={`px-4 py-2 rounded ${dateRange === "30d" ? "bg-blue-500 text-white" : "bg-gray-300"}`}
-          onClick={() => setDateRange("30d")}
-        >
-          Last 30 Days
-        </button>
+      {/* Filters UI */}
+      <div className="flex flex-wrap gap-4 mb-6">
+        {/* Date Range Filters */}
+        <div className="flex space-x-2">
+          <button className={`px-4 py-2 rounded ${dateRange === "1d" ? "bg-blue-500 text-white" : "bg-gray-300"}`} onClick={() => setDateRange("1d")}>Last 24 Hours</button>
+          <button className={`px-4 py-2 rounded ${dateRange === "7d" ? "bg-blue-500 text-white" : "bg-gray-300"}`} onClick={() => setDateRange("7d")}>Last 7 Days</button>
+          <button className={`px-4 py-2 rounded ${dateRange === "30d" ? "bg-blue-500 text-white" : "bg-gray-300"}`} onClick={() => setDateRange("30d")}>Last 30 Days</button>
+        </div>
+
+        {/* Asset Type Selector */}
+        <div className="flex space-x-2">
+          <button className={`px-4 py-2 rounded ${selectedAssetType === "stocks" ? "bg-blue-500 text-white" : "bg-gray-300"}`} onClick={() => setSelectedAssetType("stocks")}>Stocks</button>
+          <button className={`px-4 py-2 rounded ${selectedAssetType === "crypto" ? "bg-green-500 text-white" : "bg-gray-300"}`} onClick={() => setSelectedAssetType("crypto")}>Crypto</button>
+        </div>
+
+        {/* Stock Selector */}
+        <select className="px-4 py-2 border rounded" onChange={(e) => setSelectedStock(e.target.value)} value={selectedStock}>
+          {stockList.map((stock) => (
+            <option key={stock} value={stock}>{stock}</option>
+          ))}
+        </select>
       </div>
 
-      {/* Toggle Between Stocks & Crypto */}
-      <div className="flex space-x-4 mb-4">
-        <button
-          className={`px-4 py-2 rounded ${selectedAssetType === "stocks" ? "bg-blue-500 text-white" : "bg-gray-300"}`}
-          onClick={() => setSelectedAssetType("stocks")}
-        >
-          Stocks
-        </button>
-        <button
-          className={`px-4 py-2 rounded ${selectedAssetType === "crypto" ? "bg-green-500 text-white" : "bg-gray-300"}`}
-          onClick={() => setSelectedAssetType("crypto")}
-        >
-          Crypto
-        </button>
-      </div>
-
-      {/* Table View with Pagination */}
+      {/* Table View */}
       <div className="overflow-x-auto">
         <table className="w-full bg-white shadow-md rounded-lg">
           <thead className="bg-gray-200">
@@ -126,15 +120,9 @@ const App = () => {
               <tr key={index} className="border-b">
                 <td className="p-2">{row.Stock}</td>
                 <td className="p-2">{row.Predicted_Time}</td>
-                <td className="p-2">
-                  ${row.Predicted_Close.toFixed(2)} / £{row.Predicted_Close_GBP.toFixed(2)}
-                </td>
+                <td className="p-2">${row.Predicted_Close.toFixed(2)} / £{row.Predicted_Close_GBP.toFixed(2)}</td>
                 <td className="p-2">{row.Actual_Time || "Pending"}</td>
-                <td className="p-2">
-                  {row.Actual_Close
-                    ? `$${row.Actual_Close.toFixed(2)} / £${row.Actual_Close_GBP?.toFixed(2)}`
-                    : "Pending"}
-                </td>
+                <td className="p-2">{row.Actual_Close ? `$${row.Actual_Close.toFixed(2)} / £${row.Actual_Close_GBP?.toFixed(2)}` : "Pending"}</td>
                 <td className="p-2">{row.Correct || "?"}</td>
               </tr>
             ))}
@@ -143,31 +131,21 @@ const App = () => {
       </div>
 
       {/* Graph */}
-      <h2 className="text-xl font-bold mt-6">{selectedAssetType === "stocks" ? "📊 Stocks" : "📊 Crypto"}</h2>
+      <h2 className="text-xl font-bold mt-6">📊 {selectedStock === "All" ? "All Predictions" : selectedStock}</h2>
       <ResponsiveContainer width="100%" height={400}>
-        <LineChart data={formatGraphData(selectedAssetType === "stocks" ? stocks : crypto)}>
+        <LineChart data={formatGraphData(selectedData)}>
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis dataKey="Date" />
           <YAxis />
           <Tooltip />
           <Legend />
-
-          {selectedAssetType === "stocks"
-            ? Array.from(new Set(stocks.map((d) => d.Stock))).map((stock) => (
-                <Line key={stock} type="monotone" dataKey={`${stock} - Predicted`} stroke="blue" dot={{ r: 4 }} />
-              ))
-            : Array.from(new Set(crypto.map((d) => d.Stock))).map((cryptoStock) => (
-                <Line key={cryptoStock} type="monotone" dataKey={`${cryptoStock} - Predicted`} stroke="green" dot={{ r: 4 }} />
-              ))}
+          <Line type="monotone" dataKey={`${selectedStock} - Predicted`} stroke="blue" dot={{ r: 4 }} />
+          <Line type="monotone" dataKey={`${selectedStock} - Actual`} stroke="red" dot={{ r: 4 }} />
         </LineChart>
       </ResponsiveContainer>
     </div>
   );
 };
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
+ReactDOM.createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);
 
